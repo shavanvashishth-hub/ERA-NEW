@@ -50,6 +50,10 @@ on:
         description: "Also build the NSIS installer next to the portable EXE"
         type: boolean
         default: true
+      bake_gemini_key:
+        description: "PRIVATE TEST BUILDS ONLY - bake GEMINI_API_KEY from repo secrets into the EXE"
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["v*"]
@@ -126,30 +130,47 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Download relocatable CPython into resources/python_runtime
         shell: pwsh
+        env:
+          # GitHub does NOT expose the token as $env:GITHUB_TOKEN by default.
+          # It must be mapped in explicitly, otherwise the API call 401s.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $dest = "era-voice-assistant\resources\python_runtime"
           New-Item -ItemType Directory -Force $dest | Out-Null
 
-          $headers = @{
-            "User-Agent"    = "era-build"
-            "Authorization" = "Bearer $env:GITHUB_TOKEN"
-            "Accept"        = "application/vnd.github+json"
-          }
-          $rel = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" `
-            -Headers $headers
-
           $pattern = "^cpython-$([regex]::Escape($env:PY_MINOR))\.\d+\+.*-x86_64-pc-windows-msvc-install_only\.tar\.gz$"
-          $asset = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
-          if (-not $asset) {
-            throw "No CPython $env:PY_MINOR windows install_only asset in release $($rel.tag_name)"
+          $url = $null
+
+          try {
+            $headers = @{ "User-Agent" = "era-build"; "Accept" = "application/vnd.github+json" }
+            if ($env:GH_TOKEN) { $headers["Authorization"] = "Bearer $env:GH_TOKEN" }
+            $rel = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" `
+              -Headers $headers
+            $asset = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
+            if ($asset) {
+              $url = $asset.browser_download_url
+              Write-Host "release $($rel.tag_name) -> $($asset.name)  ($([math]::Round($asset.size/1MB,1)) MB)"
+            } else {
+              Write-Host "::warning::no CPython $env:PY_MINOR asset in release $($rel.tag_name)"
+            }
+          } catch {
+            Write-Host "::warning::GitHub API lookup failed: $($_.Exception.Message)"
           }
-          Write-Host "Using $($asset.name)  ($([math]::Round($asset.size/1MB,1)) MB)"
+
+          if (-not $url) {
+            # Pinned fallback (this exact asset was verified to exist)
+            $tag  = "20261124"
+            $name = "cpython-3.11.18+20261124-x86_64-pc-windows-msvc-install_only.tar.gz"
+            $url  = "https://github.com/astral-sh/python-build-standalone/releases/download/$tag/$([uri]::EscapeDataString($name))"
+            Write-Host "::warning::falling back to pinned $name"
+          }
 
           $tar = Join-Path $env:RUNNER_TEMP "cpython.tar.gz"
-          curl.exe -sSL --retry 3 --retry-delay 5 -o $tar $asset.browser_download_url
-          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          curl.exe -fsSL --retry 3 --retry-delay 5 -o $tar $url
+          if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+          if ((Get-Item $tar).Length -lt 10MB) { throw "downloaded archive looks too small" }
 
           $tmp = Join-Path $env:RUNNER_TEMP "cpython-extract"
           New-Item -ItemType Directory -Force $tmp | Out-Null
@@ -393,6 +414,25 @@ jobs:
           }
 
       # ---------------------------------------------------------------------
+      # 4b. Optional: bake the Gemini key for PRIVATE test builds only
+      # ---------------------------------------------------------------------
+      - name: Inject test Gemini key (private builds only)
+        if: ${{ inputs.bake_gemini_key == true }}
+        working-directory: era-voice-assistant
+        shell: pwsh
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if (-not $env:GEMINI_KEY) {
+            throw "bake_gemini_key is on but repo secret GEMINI_API_KEY is not set"
+          }
+          # Never echo the key. Written into config/ which package.json ships
+          # inside app.asar, and read by electron/main.cjs at startup.
+          @{ geminiApiKey = $env:GEMINI_KEY } | ConvertTo-Json |
+            Set-Content -Path "config\bundled-key.json" -Encoding utf8
+          Write-Host "test key injected into config/bundled-key.json (length $($env:GEMINI_KEY.Length))"
+
+      # ---------------------------------------------------------------------
       # 5. Package the single EXE
       # ---------------------------------------------------------------------
       - name: Build portable EXE (+ optional installer)
@@ -491,3 +531,4 @@ jobs:
           }
           "" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           "VoiceGuard speaker-ID bundled: **${{ inputs.with_voice_biometrics == true }}**" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "Gemini key baked in (PRIVATE TEST BUILD): **${{ inputs.bake_gemini_key == true }}**" | Out-File -Append $env:GITHUB_STEP_SUMMARY
