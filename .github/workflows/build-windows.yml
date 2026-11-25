@@ -1,0 +1,201 @@
+
+name: Build ERA Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: era-windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build ERA Standalone Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Verify project structure
+        shell: pwsh
+        run: |
+          $required = @(
+            "era-voice-assistant/package.json",
+            "era-voice-assistant/electron/main.cjs",
+            "era_agent/api_server.py",
+            "era_bridge/main.py",
+            "era_vision/main.py",
+            "era_agent/requirements.txt",
+            "era_bridge/requirements.txt",
+            "era_vision/requirements.txt"
+          )
+
+          foreach ($file in $required) {
+            if (!(Test-Path $file)) {
+              throw "Required file missing: $file"
+            }
+          }
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+
+          python -m pip install `
+            -r era_agent/requirements.txt `
+            -r era_bridge/requirements.txt `
+            -r era_vision/requirements.txt
+
+          python -c "import fastapi, uvicorn, requests, httpx, cryptography, numpy, PIL, mss, psutil; print('Python dependencies OK')"
+
+      - name: Bundle Python runtime and services
+        shell: pwsh
+        run: |
+          $frontend = "era-voice-assistant"
+          $resources = "$frontend/resources"
+
+          New-Item -ItemType Directory -Force `
+            "$resources/python_runtime" | Out-Null
+
+          New-Item -ItemType Directory -Force `
+            "$resources/era_services" | Out-Null
+
+          # Copy complete Python installation, including
+          # interpreter, standard library, DLLs and site-packages.
+          $pythonRoot = python -c "import sys; print(sys.prefix)"
+
+          Copy-Item "$pythonRoot/*" `
+            "$resources/python_runtime/" -Recurse -Force
+
+          if (!(Test-Path "$resources/python_runtime/python.exe")) {
+            throw "Bundled Python executable missing"
+          }
+
+          # Bundle all three backend services.
+          $services = @("era_agent", "era_bridge", "era_vision")
+
+          foreach ($service in $services) {
+            Copy-Item $service `
+              "$resources/era_services/$service" `
+              -Recurse -Force
+
+            Get-ChildItem "$resources/era_services/$service" `
+              -Directory -Recurse |
+              Where-Object {
+                $_.Name -in @("__pycache__", ".venv", ".pytest_cache")
+              } |
+              Remove-Item -Recurse -Force
+          }
+
+          # Bundle shared memory modules.
+          if (Test-Path "era_memory") {
+            Copy-Item "era_memory" `
+              "$frontend/era_memory" -Recurse -Force
+          }
+
+          # Include root-level memory Python modules if present.
+          foreach ($file in @(
+            "era_memory_adapter.py",
+            "era_memory_service.py"
+          )) {
+            if (Test-Path $file) {
+              Copy-Item $file "$frontend/$file" -Force
+            }
+          }
+
+          # Verify runtime and backend payload.
+          foreach ($service in $services) {
+            if (!(Test-Path "$resources/era_services/$service")) {
+              throw "Bundled service missing: $service"
+            }
+          }
+
+          & "$resources/python_runtime/python.exe" `
+            -c "import fastapi, uvicorn, requests, httpx, numpy, PIL; print('Bundled Python runtime verified')"
+
+      - name: Install Node dependencies
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+
+      - name: Build React and Express application
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          npm run build
+
+          if (!(Test-Path "dist/index.html")) {
+            throw "Frontend build failed: dist/index.html missing"
+          }
+
+          if (!(Test-Path "dist/server.cjs")) {
+            throw "Express server bundle missing"
+          }
+
+      - name: Build Windows installer and portable EXE
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          npx electron-builder --win nsis portable --x64
+
+          if (!(Test-Path "dist-electron")) {
+            throw "Electron build output missing"
+          }
+
+          $executables = Get-ChildItem `
+            "dist-electron/*.exe"
+
+          if ($executables.Count -lt 2) {
+            throw "Expected NSIS installer and portable EXE"
+          }
+
+          Write-Host "Generated executables:"
+          $executables | ForEach-Object {
+            Write-Host $_.FullName
+          }
+
+      - name: Upload Windows EXE artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ERA-Windows-x64
+          path: |
+            era-voice-assistant/dist-electron/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            era-voice-assistant/dist-electron/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
