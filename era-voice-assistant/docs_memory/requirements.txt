@@ -1,0 +1,4 @@
+# Core engine: Python 3.9+ standard library only (sqlite3 with FTS5). No mandatory third-party packages.
+# Optional accelerators (all local, none required):
+#   numpy>=1.24                  # faster vector search
+#   sentence-transformers>=2.2   # true semantic embeddings from a LOCAL model directory (never auto-downloaded)

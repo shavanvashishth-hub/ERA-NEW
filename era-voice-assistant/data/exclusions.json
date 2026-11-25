@@ -1,0 +1,13 @@
+{
+  "processes": [
+    "1password.exe",
+    "bitwarden.exe",
+    "keepass.exe",
+    "lastpass.exe"
+  ],
+  "title_keywords": [
+    "incognito",
+    "password",
+    "private browsing"
+  ]
+}
