@@ -1,0 +1,462 @@
+name: Build ERA Single-File Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the build (e.g. 1.2.0). Blank = use package.json version."
+        required: false
+        default: ""
+      with_voice_biometrics:
+        description: "Bundle PyTorch + SpeechBrain for VoiceGuard speaker-ID (adds ~1.5 GB to the EXE)"
+        type: boolean
+        default: false
+      bundle_tesseract:
+        description: "Bundle the Tesseract OCR engine (adds ~120 MB, needs a 1-line code change to be used)"
+        type: boolean
+        default: false
+      make_installer:
+        description: "Also build the NSIS installer next to the portable EXE"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: era-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PY_MINOR: "3.11"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+  ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.eb-cache
+  PIP_CACHE_DIR: ${{ github.workspace }}\.pip-cache
+
+jobs:
+  build:
+    name: Build ERA portable EXE (windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Windows long paths (Python site-packages get deep)
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+          Write-Host "long paths enabled"
+
+      # ---------------------------------------------------------------------
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: era-voice-assistant/package-lock.json
+
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\.pip-cache
+          key: pip-win-v1-${{ hashFiles('era_agent/requirements.txt','era_bridge/requirements.txt','era_vision/requirements.txt') }}
+          restore-keys: |
+            pip-win-v1-
+
+      - name: Cache electron-builder binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\.eb-cache
+          key: eb-win-v1-${{ hashFiles('era-voice-assistant/package-lock.json') }}
+          restore-keys: |
+            eb-win-v1-
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          node -v
+          npm -v
+          Write-Host "repo files: $((Get-ChildItem -Recurse -File | Measure-Object).Count)"
+
+      # ---------------------------------------------------------------------
+      # 1. Portable CPython, shipped inside the EXE
+      # ---------------------------------------------------------------------
+      - name: Download relocatable CPython into resources/python_runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = "era-voice-assistant\resources\python_runtime"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+
+          $headers = @{
+            "User-Agent"    = "era-build"
+            "Authorization" = "Bearer $env:GITHUB_TOKEN"
+            "Accept"        = "application/vnd.github+json"
+          }
+          $rel = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" `
+            -Headers $headers
+
+          $pattern = "^cpython-$([regex]::Escape($env:PY_MINOR))\.\d+\+.*-x86_64-pc-windows-msvc-install_only\.tar\.gz$"
+          $asset = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
+          if (-not $asset) {
+            throw "No CPython $env:PY_MINOR windows install_only asset in release $($rel.tag_name)"
+          }
+          Write-Host "Using $($asset.name)  ($([math]::Round($asset.size/1MB,1)) MB)"
+
+          $tar = Join-Path $env:RUNNER_TEMP "cpython.tar.gz"
+          curl.exe -sSL --retry 3 --retry-delay 5 -o $tar $asset.browser_download_url
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+
+          $tmp = Join-Path $env:RUNNER_TEMP "cpython-extract"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          tar.exe -xzf $tar -C $tmp
+          if ($LASTEXITCODE -ne 0) { throw "extract failed" }
+
+          # tarball root is "python/" -> flatten so python.exe sits at resources/python_runtime/python.exe
+          Copy-Item (Join-Path $tmp "python\*") $dest -Recurse -Force
+
+          if (-not (Test-Path "$dest\python.exe")) { throw "bundled python.exe missing" }
+          if (-not (Test-Path "$dest\python311.dll")) { throw "bundled python311.dll missing" }
+
+          & "$dest\python.exe" -c "import sys, ssl, sqlite3; print('bundled python', sys.version)"
+
+          # shrink the payload: debug symbols + CPython test suites are not needed
+          Get-ChildItem $dest -Recurse -Filter *.pdb -File | Remove-Item -Force -ErrorAction SilentlyContinue
+          foreach ($junk in @("Lib\test","Lib\idlelib","Lib\turtledemo","Lib\lib2to3\tests")) {
+            $p = Join-Path $dest $junk
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+          }
+          $size = (Get-ChildItem $dest -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "python_runtime size: $([math]::Round($size/1MB,1)) MB"
+
+      # ---------------------------------------------------------------------
+      # 2. All Python dependencies into that interpreter (never into system Python)
+      # ---------------------------------------------------------------------
+      - name: Install Python dependencies into the bundled runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $py = "era-voice-assistant\resources\python_runtime\python.exe"
+
+          # Keep NumPy on the 1.x line: era_vision/requirements.txt needs numpy<2
+          # and the MediaPipe / OpenCV wheels that ship with it expect 1.x too.
+          Set-Content -Path "build-constraints.txt" -Encoding ascii -Value @("numpy<2")
+
+          & $py -m pip install --upgrade --no-warn-script-location pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+
+          & $py -m pip install --no-warn-script-location -c build-constraints.txt `
+            -r era_agent/requirements.txt `
+            -r era_bridge/requirements.txt `
+            -r era_vision/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "service requirements failed" }
+
+          # Extra libraries the code imports directly (pyautogui, win32gui, cv2,
+          # mediapipe, sounddevice, pycaw, screen-brightness-control, playwright ...).
+          # Without these the app silently degrades on a clean PC.
+          $extras = @(
+            "pywin32>=306",
+            "pyautogui>=0.9.54",
+            "mediapipe>=0.10.14",
+            "sounddevice>=0.4.6",
+            "psutil>=5.9",
+            "mss>=9",
+            "Pillow>=10",
+            "pytesseract>=0.3.10",
+            "keyring>=24,<26",
+            "comtypes>=1.2",
+            "pycaw>=20240210",
+            "screen-brightness-control>=0.22",
+            "pynput>=1.7",
+            "keyboard>=0.13.5",
+            "playwright>=1.44",
+            "websockets>=12",
+            "aiohttp>=3.9"
+          )
+          Set-Content -Path "build-extras.txt" -Encoding ascii -Value $extras
+
+          & $py -m pip install --no-warn-script-location -c build-constraints.txt -r build-extras.txt
+          if ($LASTEXITCODE -ne 0) { throw "extra requirements failed" }
+
+          & $py -m pip freeze | Set-Content -Path "pip-freeze.txt" -Encoding utf8
+          Write-Host "installed packages: $((Get-Content pip-freeze.txt).Count)"
+
+      - name: Optional - VoiceGuard speaker-ID (PyTorch CPU + SpeechBrain)
+        if: ${{ inputs.with_voice_biometrics == true }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $py = "era-voice-assistant\resources\python_runtime\python.exe"
+          & $py -m pip install --no-warn-script-location -c build-constraints.txt `
+            torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
+          & $py -m pip install --no-warn-script-location -c build-constraints.txt speechbrain
+          if ($LASTEXITCODE -ne 0) { throw "speechbrain install failed" }
+          & $py -c "import torch, speechbrain; print('torch', torch.__version__)"
+
+      - name: Install Playwright Chromium inside the bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $py = "era-voice-assistant\resources\python_runtime\python.exe"
+          # PLAYWRIGHT_BROWSERS_PATH=0 puts the browser next to the playwright
+          # package itself, i.e. inside the bundled interpreter, so it travels
+          # with the EXE and no `playwright install` is needed on the user's PC.
+          $env:PLAYWRIGHT_BROWSERS_PATH = "0"
+          & $py -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "playwright chromium install failed" }
+
+      - name: Write the import self-check script
+        shell: pwsh
+        run: |
+          $lines = @(
+            "import importlib, sys",
+            "mods = ['fastapi','uvicorn','pydantic','requests','httpx','cryptography','numpy',",
+            "        'PIL','mss','psutil','cv2','mediapipe','sounddevice','win32gui','win32com',",
+            "        'pyautogui','playwright','pytesseract','keyring','comtypes','pycaw',",
+            "        'screen_brightness_control','websockets','aiohttp','dotenv','googleapiclient']",
+            "bad = []",
+            "for m in mods:",
+            "    try:",
+            "        importlib.import_module(m)",
+            "    except Exception as e:",
+            "        bad.append(m + ': ' + type(e).__name__ + ': ' + str(e))",
+            "import numpy",
+            "print('numpy', numpy.__version__)",
+            "if bad:",
+            "    print('FAILED IMPORTS:')",
+            "    for b in bad:",
+            "        print('  -', b)",
+            "    sys.exit(1)",
+            "print('all ' + str(len(mods)) + ' imports OK')"
+          )
+          Set-Content -Path "check_imports.py" -Encoding ascii -Value $lines
+
+      - name: Verify every heavy import works from the bundled runtime
+        shell: pwsh
+        run: |
+          $py = "era-voice-assistant\resources\python_runtime\python.exe"
+          & $py check_imports.py
+          if ($LASTEXITCODE -ne 0) { throw "bundled runtime import check failed" }
+
+      # ---------------------------------------------------------------------
+      # 3. Stage the Python services + memory engine next to the app
+      # ---------------------------------------------------------------------
+      - name: Stage services, memory engine and model files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $res = "era-voice-assistant\resources"
+          $svc = "$res\era_services"
+          New-Item -ItemType Directory -Force $svc | Out-Null
+
+          foreach ($s in @("era_agent","era_bridge","era_vision")) {
+            if (Test-Path "$svc\$s") { Remove-Item -Recurse -Force "$svc\$s" }
+            Copy-Item $s "$svc\$s" -Recurse -Force
+          }
+
+          # drop dev-only weight
+          Get-ChildItem $svc -Recurse -Directory |
+            Where-Object { $_.Name -in @("__pycache__",".pytest_cache",".venv","node_modules",".git","tests") } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $svc -Recurse -Filter *.pyc -File | Remove-Item -Force -ErrorAction SilentlyContinue
+
+          # shared memory engine (electron/main.cjs + package.json expect it here)
+          New-Item -ItemType Directory -Force "era-voice-assistant\era_memory" | Out-Null
+          if (Test-Path "era_memory") {
+            Copy-Item "era_memory\*" "era-voice-assistant\era_memory" -Recurse -Force
+          }
+          foreach ($f in @("era_memory_adapter.py","era_memory_service.py")) {
+            if (Test-Path $f) { Copy-Item $f "era-voice-assistant\$f" -Force }
+          }
+
+          # MediaPipe gesture model - gesture_detector.py resolves it as
+          # <pkg>/models/gesture_recognizer.task, and the repo does not ship it.
+          $modelUrl = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
+          foreach ($dir in @("$svc\era_agent\era_agent\models", "$svc\era_agent\models")) {
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            curl.exe -sSL --retry 3 -o "$dir\gesture_recognizer.task" $modelUrl
+            if ($LASTEXITCODE -ne 0) { throw "gesture model download failed" }
+            if ((Get-Item "$dir\gesture_recognizer.task").Length -lt 1MB) {
+              throw "gesture model looks truncated"
+            }
+          }
+
+          # sanity: the files electron/main.cjs spawns must exist
+          foreach ($f in @(
+            "$svc\era_agent\api_server.py",
+            "$svc\era_bridge\main.py",
+            "$svc\era_vision\main.py"
+          )) {
+            if (-not (Test-Path $f)) { throw "missing service entrypoint: $f" }
+          }
+          $size = (Get-ChildItem $svc -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "era_services size: $([math]::Round($size/1MB,1)) MB"
+
+      - name: Optional - bundle Tesseract OCR engine
+        if: ${{ inputs.bundle_tesseract == true }}
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $src = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path $src)) { throw "tesseract install dir not found" }
+          Copy-Item $src "era-voice-assistant\resources\tesseract" -Recurse -Force
+          Write-Host "NOTE: era_vision only uses this when TESSERACT_CMD is set."
+          Write-Host "Add to buildEnvForService() in electron/main.cjs:"
+          Write-Host '  TESSERACT_CMD: path.join(RESOURCES_DIR, "tesseract", "tesseract.exe")'
+
+      # ---------------------------------------------------------------------
+      # 4. Front-end + Express bundle
+      # ---------------------------------------------------------------------
+      - name: Install Node dependencies
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::npm ci failed (lockfile drift) - falling back to npm install"
+            npm install --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+          }
+
+      - name: Build React UI + server bundle
+        working-directory: era-voice-assistant
+        shell: pwsh
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
+          foreach ($f in @("dist\index.html","dist\server.cjs")) {
+            if (-not (Test-Path $f)) { throw "build output missing: $f" }
+          }
+          $size = (Get-ChildItem dist -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "dist size: $([math]::Round($size/1MB,1)) MB"
+
+      - name: Apply version label
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          if (-not $v -and $env:GITHUB_REF -like "refs/tags/v*") {
+            $v = $env:GITHUB_REF -replace "^refs/tags/v", ""
+          }
+          if ($v) {
+            npm version $v --no-git-tag-version --allow-same-version
+            Write-Host "version set to $v"
+          } else {
+            Write-Host "using package.json version"
+          }
+
+      # ---------------------------------------------------------------------
+      # 5. Package the single EXE
+      # ---------------------------------------------------------------------
+      - name: Build portable EXE (+ optional installer)
+        working-directory: era-voice-assistant
+        shell: pwsh
+        run: |
+          $targets = @("portable")
+          if ("${{ inputs.make_installer }}" -ne "false") { $targets += "nsis" }
+          Write-Host "electron-builder targets: $($targets -join ', ')"
+
+          $ebArgs = @("electron-builder","--win") + $targets + @("--x64","--publish","never")
+          Write-Host ("npx " + ($ebArgs -join " "))
+          & npx @ebArgs
+          if ($LASTEXITCODE -ne 0) { throw "electron-builder failed" }
+
+          Get-ChildItem "dist-electron\*.exe" | ForEach-Object {
+            Write-Host ("  {0}  {1} MB" -f $_.Name, [math]::Round($_.Length/1MB,1))
+          }
+
+      # ---------------------------------------------------------------------
+      # 6. Prove the packaged app is self-contained BEFORE uploading
+      # ---------------------------------------------------------------------
+      - name: Verify packaged payload is self-contained
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $res = "era-voice-assistant\dist-electron\win-unpacked\resources"
+
+          $required = @(
+            "$res\app.asar",
+            "$res\python_runtime\python.exe",
+            "$res\python_runtime\python311.dll",
+            "$res\python_runtime\vcruntime140.dll",
+            "$res\python_runtime\Lib\site-packages\fastapi",
+            "$res\python_runtime\Lib\site-packages\uvicorn",
+            "$res\python_runtime\Lib\site-packages\cv2",
+            "$res\python_runtime\Lib\site-packages\mediapipe",
+            "$res\python_runtime\Lib\site-packages\win32\win32gui.pyd",
+            "$res\era_services\era_agent\api_server.py",
+            "$res\era_services\era_bridge\main.py",
+            "$res\era_services\era_vision\main.py",
+            "$res\era_services\era_agent\era_agent\models\gesture_recognizer.task",
+            "$res\era_memory"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Host "::error::missing from package: $_" }
+            throw "packaged app is not self-contained"
+          }
+
+          # the bundled interpreter inside the PACKAGED tree must import everything
+          $unpacked = "era-voice-assistant\dist-electron\win-unpacked"
+          Copy-Item "check_imports.py" "$unpacked\check_imports.py" -Force
+          & "$res\python_runtime\python.exe" "$unpacked\check_imports.py"
+          if ($LASTEXITCODE -ne 0) { throw "packaged runtime import check failed" }
+
+          # the services must at least byte-compile inside the package
+          & "$res\python_runtime\python.exe" -m compileall -q `
+            "$res\era_services\era_bridge" "$res\era_services\era_vision" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "service compileall failed" }
+          Write-Host "payload verified"
+
+      # ---------------------------------------------------------------------
+      # 7. Ship it
+      # ---------------------------------------------------------------------
+      - name: Upload EXE artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ERA-Windows-x64
+          path: |
+            era-voice-assistant/dist-electron/*.exe
+            pip-freeze.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: era-voice-assistant/dist-electron/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Job summary
+        if: always()
+        shell: pwsh
+        run: |
+          "### ERA Windows build" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "| File | Size |" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "| --- | --- |" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem "era-voice-assistant\dist-electron\*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            "| $($_.Name) | $([math]::Round($_.Length/1MB,1)) MB |" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          }
+          "" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "VoiceGuard speaker-ID bundled: **${{ inputs.with_voice_biometrics == true }}**" | Out-File -Append $env:GITHUB_STEP_SUMMARY
