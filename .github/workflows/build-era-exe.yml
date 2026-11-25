@@ -1,3 +1,34 @@
+# =============================================================================
+#  ERA — Single-File Windows EXE builder
+#  Repo: shavanvashishth-hub/ERA-NEW
+#
+#  WHAT THIS PRODUCES
+#    1. ERA_Portable_<version>.exe  -> ONE self-contained .exe. Double-click,
+#       it self-extracts to %TEMP% and runs. No Python, no Node, no pip, no
+#       libraries needed on the user's PC.
+#    2. (optional) NSIS installer  -> "ERA AI Assistant Setup <version>.exe"
+#
+#  HOW "ALWAYS WORKS ON ANY PC" IS GUARANTEED
+#    * A relocatable CPython 3.11 (python-build-standalone) is downloaded at
+#      build time and shipped inside the EXE at resources/python_runtime.
+#      It carries python311.dll + vcruntime140.dll, so no VC++ redist and no
+#      system Python are required.
+#    * Every Python dependency (fastapi, uvicorn, opencv, mediapipe, pywin32,
+#      pyautogui, sounddevice, playwright + Chromium, ...) is pip-installed
+#      INTO that bundled interpreter, never into the runner's global Python.
+#    * electron/main.cjs resolves python.exe as
+#        resources/python_runtime/python.exe   (bundled, always first)
+#      and the Express server uses resourcesPath/python_runtime/python.exe.
+#    * The MediaPipe gesture model file is downloaded and placed where
+#      era_agent/era_agent/gestures/gesture_detector.py looks for it.
+#    * The whole payload is verified before the EXE is uploaded: the bundled
+#      interpreter must import every heavy module from inside the packaged
+#      app directory.
+#
+#  INSTALL: put this file at  .github/workflows/build-era-exe.yml
+#           (and delete/disable the old build-windows.yml so you don't build twice)
+# =============================================================================
+
 name: Build ERA Single-File Windows EXE
 
 on:
